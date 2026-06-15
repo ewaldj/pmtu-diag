@@ -415,7 +415,7 @@ def main():
 
     print("%s%s  ----------------------------------------------------------" % (C.BLD, C.CYN))
     print("%s%s  Path MTU Diagnostic / pmtu-diag.py v%s %s" % (C.BLD, C.CYN, VERSION, C.RST))
-    print("%s%s  by AI & ewald@jeitler.cc - bidirectional, scapy-based" % (C.BLD, C.CYN))
+    print("%s%s  by AI & ewald@jeitler.cc - Zero fragmentation. Zero stress" % (C.BLD, C.CYN))
     print("%s%s  ----------------------------------------------------------" % (C.BLD, C.CYN))
     print("  %s%s  |  Platform: %s%s" %
           (C.GRY, time.strftime("%Y-%m-%d %H:%M:%S"), sys.platform, C.RST))
