@@ -10,7 +10,7 @@ readonly SCRIPT_NAME="$(basename "$0")"
 set -euo pipefail
 
 readonly CUSTOM_GITHUB_TOOLS=(
-    "muxpi.sh|https://raw.githubusercontent.com/ewaldj/pmtu-diag/main/pmtu-diag.py"
+    "pmut-diag.py|https://raw.githubusercontent.com/ewaldj/pmtu-diag/main/pmtu-diag.py"
 )
 
 readonly DEFAULT_BINDIR="/usr/local/bin"
