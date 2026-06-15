@@ -10,6 +10,13 @@ tells you whether PMTU Discovery actually works on the path — something a plai
 
 ---
 
+
+## Install/Update  muxpi.sh  
+```
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ewaldj/pmtu-diag/main/e-install.sh)"
+```
+
+
 ## What it measures
 
 | Direction | Method |
