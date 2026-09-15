@@ -31,7 +31,7 @@
 #   (auto-elevates via sudo if not already root)
 # ================================================================
 
-VERSION = "0.92"
+VERSION = "1.00"
 
 import argparse
 import os
@@ -68,23 +68,48 @@ except ImportError:
         "  generic       : pip install scapy --break-system-packages"
     )
 
-if os.geteuid() != 0:
-    # Not running as root. Re-exec the script through sudo so the user is
+def have_cap_net_raw():
+    """Return whether this Linux process has effective CAP_NET_RAW."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("CapEff:"):
+                    effective = int(line.split()[1], 16)
+                    return bool(effective & (1 << 13))  # CAP_NET_RAW
+    except Exception:
+        pass
+
+    return False
+
+
+needs_sudo = os.geteuid() != 0
+if sys.platform.startswith("linux"):
+    has_capability = have_cap_net_raw()
+    if os.geteuid() == 0 and not has_capability:
+        die("ERROR: CAP_NET_RAW is not effective, even though this process is root.\n"
+            "  Container runtimes can remove it from root. Ensure NET_RAW is in the\n"
+            "  effective and bounding capability sets; check seccomp, AppArmor or SELinux.")
+    needs_sudo = not has_capability
+
+if needs_sudo:
+    # Without root or CAP_NET_RAW, re-exec through sudo so the user is
     # prompted for their password, then continues as root. We guard against
     # an infinite loop with an env marker in case sudo itself fails to
     # elevate (e.g. user not in sudoers).
     if os.environ.get("PMTU_DIAG_SUDO_REEXEC") == "1":
-        die("ERROR: still not root after sudo — cannot acquire raw sockets.\n"
-            "  Run the script directly as root instead.")
+        die("ERROR: raw-socket access is still unavailable after sudo.\n"
+            "  Sudo did not grant root or CAP_NET_RAW. Check the container or host policy.")
     sudo_path = None
     for p in ("/usr/bin/sudo", "/bin/sudo", "/usr/local/bin/sudo"):
         if os.path.exists(p):
             sudo_path = p
             break
     if sudo_path is None:
-        die("ERROR: root privileges are required (raw sockets) and 'sudo'\n"
+        die("ERROR: raw-socket access requires CAP_NET_RAW (or root), and 'sudo'\n"
             "  was not found. Re-run as root: " + " ".join(sys.argv))
-    sys.stderr.write("Root privileges required — elevating via sudo...\n")
+    sys.stderr.write("CAP_NET_RAW or root privileges required — elevating via sudo...\n")
     env = dict(os.environ, PMTU_DIAG_SUDO_REEXEC="1")
     # Re-exec through sudo. We pass the absolute interpreter path
     # (sys.executable) explicitly, so the same Python (e.g. Homebrew with
@@ -109,17 +134,23 @@ class C:
         RED = GRN = YLW = CYN = BLD = RST = GRY = MGN = ""
 
 
-def hdr(title):
+def hdr(title, blank_before=True):
+    # blank_before=False for the very first section header in --quiet-header
+    # (web) mode: with the banner block suppressed there, that section is the
+    # first thing printed at all, so the leading blank line this normally
+    # adds to separate sections would otherwise just be empty space with
+    # nothing above it.
     pad = max(0, 56 - len(title))
-    print("\n%s%s── %s %s%s%s" % (C.BLD, C.MGN, title, C.RST, C.GRY, "-" * pad) + C.RST)
+    prefix = "\n" if blank_before else ""
+    print("%s%s%s── %s %s%s%s" % (prefix, C.BLD, C.MGN, title, C.RST, C.GRY, "-" * pad) + C.RST)
 
 
 def ok(msg):   print("  %sOK%s   %s" % (C.GRN, C.RST, msg))
 def fail(msg): print("  %sXX%s   %s" % (C.RED, C.RST, msg))
 def warn(msg): print("  %s!!%s   %s" % (C.YLW, C.RST, msg))
 def info(msg): print("  %s->%s   %s" % (C.GRY, C.RST, msg))
-def row(label, val, color=""):
-    print("  %-42s %s%s%s%s" % (label, color, C.BLD, val, C.RST))
+def row(label, val, color="", width=26):
+    print("  %-*s %s%s%s%s" % (width, label, color, C.BLD, val, C.RST))
 
 
 # ── Low-level probe primitives ───────────────────────────────────
@@ -231,7 +262,9 @@ def measure_reply_mtu(target, total_size, iface, timeout, ident, count):
     # trailing fragments carry no ICMP header and would be missed.
     bpf = "src host %s and (ip[6:2] & 0x3fff) != 0" % target
     try:
-        sniffer = AsyncSniffer(filter=bpf, iface=iface, store=True)
+        # Promiscuous capture is unnecessary: only traffic addressed to this
+        # host is relevant. Disabling it avoids requiring CAP_NET_ADMIN.
+        sniffer = AsyncSniffer(filter=bpf, iface=iface, store=True, promisc=False)
         sniffer.start()
         sniffer_ok = True
     except Exception:
@@ -362,6 +395,11 @@ def main():
                     help="upper MTU bound for the search (default: local MTU)")
     ap.add_argument("--timeout", type=float, default=2.0,
                     help="per-probe reply timeout in seconds (default: 2)")
+    ap.add_argument("--quiet-header", action="store_true",
+                    help="Suppress the banner/timestamp/interface header line "
+                         "(used for the web version — server-internal details "
+                         "like the local interface name aren't meaningful to "
+                         "a visitor, and the target is already shown on the page)")
     args = ap.parse_args()
 
     target = args.target
@@ -413,15 +451,16 @@ def main():
     local_mtu = local_mtu_for(iface) if iface else 1500
     max_mtu = args.max or local_mtu
 
-    print("%s%s  ----------------------------------------------------------" % (C.BLD, C.CYN))
-    print("%s%s  Path MTU Diagnostic / pmtu-diag.py v%s %s" % (C.BLD, C.CYN, VERSION, C.RST))
-    print("%s%s  by AI & ewald@jeitler.cc - Zero fragmentation. Zero stress" % (C.BLD, C.CYN))
-    print("%s%s  ----------------------------------------------------------" % (C.BLD, C.CYN))
-    print("  %s%s  |  Platform: %s%s" %
-          (C.GRY, time.strftime("%Y-%m-%d %H:%M:%S"), sys.platform, C.RST))
-    target_disp = ("%s (%s)" % (target_host, target)) if target_host else target
-    print("  Target: %s%s%s   Iface: %s%s%s   Probes/test: %s%d%s" %
-          (C.BLD, target_disp, C.RST, C.BLD, iface or "?", C.RST, C.BLD, count, C.RST))
+    if not args.quiet_header:
+        print("%s%s  ----------------------------------------------------------" % (C.BLD, C.CYN))
+        print("%s%s  Path MTU Diagnostic / pmtu-diag.py v%s %s" % (C.BLD, C.CYN, VERSION, C.RST))
+        print("%s%s  by AI & ewald@jeitler.cc - May your packets always fit" % (C.BLD, C.CYN))
+        print("%s%s  ----------------------------------------------------------" % (C.BLD, C.CYN))
+        print("  %s%s  |  Platform: %s%s" %
+              (C.GRY, time.strftime("%Y-%m-%d %H:%M:%S"), sys.platform, C.RST))
+        target_disp = ("%s (%s)" % (target_host, target)) if target_host else target
+        print("  Target: %s%s%s   Iface: %s%s%s   Probes/test: %s%d%s" %
+              (C.BLD, target_disp, C.RST, C.BLD, iface or "?", C.RST, C.BLD, count, C.RST))
 
     if is_loopback_target:
         warn("Target %s is one of THIS host's own addresses (loopback path)." % target)
@@ -430,7 +469,7 @@ def main():
         sys.exit(2)
 
     # ── 1: Reachability ──────────────────────────────────────────
-    hdr("1/5  Reachability")
+    hdr("1/5  Reachability", blank_before=not args.quiet_header)
     r = sr1(IP(dst=target) / ICMP() / (b"\xa5" * 56),
             timeout=timeout, verbose=0)
     if classify_reply(r)[0] != "echo":
@@ -439,11 +478,15 @@ def main():
         info("dropping crafted/raw ICMP, or the target is on a non-routed path.")
         sys.exit(1)
     ok("Reachable (basic ICMP echo answered)")
-    if iface:
-        ok("Interface: %s%s%s  |  local MTU: %s%d%s bytes" %
-           (C.BLD, iface, C.RST, C.BLD, local_mtu, C.RST))
-    if src_ip:
-        info("Source IP: %s" % src_ip)
+    if not args.quiet_header:
+        # Same reasoning as the banner above: this server's own interface
+        # name/local MTU and its source IP toward the target are internal
+        # details, not something a web visitor needs to see.
+        if iface:
+            ok("Interface: %s%s%s  |  local MTU: %s%d%s bytes" %
+               (C.BLD, iface, C.RST, C.BLD, local_mtu, C.RST))
+        if src_ip:
+            info("Source IP: %s" % src_ip)
 
     # ── 2: PMTUD function test (does the ICMP signal come back?) ──
     hdr("2/5  PMTUD function test")
@@ -494,7 +537,6 @@ def main():
     hdr("3/5  Forward path MTU (binary search)")
     info("Search range: %d - %d bytes  |  pass threshold: %d/%d" %
          (IPV4_MIN_MTU, max_mtu, need, count))
-    print("")
 
     res = binary_search_mtu(target, iface, timeout, count, need,
                             IPV4_MIN_MTU, max_mtu, ident_base=0x3000)
@@ -548,7 +590,6 @@ def main():
 
     # ── 5: Result ────────────────────────────────────────────────
     hdr("5/5  Result")
-    print("")
 
     # Effective bidirectional MTU and MSS from the smaller direction.
     eff_mtu = fwd_mtu
@@ -556,48 +597,59 @@ def main():
         eff_mtu = reply_mtu
     mss = eff_mtu - TCP_OVERHEAD
 
-    row("Forward path MTU (verified):", "%d bytes" % fwd_mtu)
-    if nexthop_reported or nexthop_during_search:
-        nh = nexthop_reported or nexthop_during_search
-        col = C.GRN if nh == fwd_mtu else C.YLW
-        row("Forward MTU (ICMP next-hop report):", "%d bytes" % nh, col)
-        if nh != fwd_mtu:
-            info("Note: ICMP-reported next-hop MTU (%d) differs from the verified" % nh)
-            info("value (%d). The verified binary-search result is authoritative." % fwd_mtu)
-    if reply_frag:
-        row("Reply path MTU (captured):", "%d bytes" % reply_mtu, C.YLW)
-        row("Effective PMTU (min of both):", "%d bytes" % eff_mtu, C.YLW)
+    nh = nexthop_reported or nexthop_during_search
 
     pmtud_txt = {
         "WORKING":        "%sworking%s (ICMP frag-needed returned)" % (C.GRN, C.RST),
         "ICMP_FILTERED":  "%sICMP filtered%s -> black-hole risk" % (C.YLW, C.RST),
         "OFFLOAD_BYPASS": "%sDF bypassed%s (offload/path fragmenting)" % (C.YLW, C.RST),
-        "NOT_TRIGGERED":  "%snot triggered%s (no bottleneck below %d B to test)" %
+        "NOT_TRIGGERED":  "%snot triggered%s (no bottleneck below %dB)" %
                           (C.GRY, C.RST, max_mtu),
         "PENDING":        "%sinconclusive%s" % (C.GRY, C.RST),
         "UNKNOWN":        "%sunknown%s" % (C.GRY, C.RST),
     }.get(pmtud_status, "%s%s%s" % (C.GRY, pmtud_status, C.RST))
-    print("  %-42s %s" % ("PMTUD status:", pmtud_txt))
 
+    sym_extra_info = False
     if reply_frag and abs(reply_mtu - fwd_mtu) <= 7:
         # Within the 8-byte fragment-rounding uncertainty -> same MTU.
-        print("  %-42s %ssymmetric%s (forward %d / reply ~%d)" %
-              ("Path symmetry:", C.GRN, C.RST, fwd_mtu, reply_mtu))
+        sym_txt = "%ssymmetric%s (forward %d / reply ~%d)" % (C.GRN, C.RST, fwd_mtu, reply_mtu)
     elif reply_frag:
-        print("  %-42s %sasymmetric%s (forward %d / reply %d)" %
-              ("Path symmetry:", C.YLW, C.RST, fwd_mtu, reply_mtu))
+        sym_txt = "%sasymmetric%s (forward %d / reply %d)" % (C.YLW, C.RST, fwd_mtu, reply_mtu)
     elif not reply_sent_ok:
-        print("  %-42s %sreply not measurable%s (local send limit)" %
-              ("Path symmetry:", C.GRY, C.RST))
+        sym_txt = "%sreply not measurable%s (local send limit)" % (C.GRY, C.RST)
     elif reply_probe_size <= fwd_mtu:
-        print("  %-42s %sreply not exercised%s (probe <= forward MTU)" %
-              ("Path symmetry:", C.GRY, C.RST))
+        sym_txt = "%sreply not exercised%s (probe <= forward MTU)" % (C.GRY, C.RST)
     else:
-        print("  %-42s %sasymmetric%s (forward %d / reply >=%d)" %
-              ("Path symmetry:", C.YLW, C.RST, fwd_mtu, reply_probe_size))
+        sym_txt = "%sasymmetric%s (forward %d / reply >=%d)" % (C.YLW, C.RST, fwd_mtu, reply_probe_size)
+        sym_extra_info = True
+
+    # Build the full row set first, so the value column can be aligned to
+    # the actual longest label in THIS run rather than a guessed fixed
+    # width — every value then starts in the same vertical column.
+    rows = [("Forward path MTU (verified):", "%d bytes" % fwd_mtu, "")]
+    if nh:
+        col = C.GRN if nh == fwd_mtu else C.YLW
+        rows.append(("Forward MTU (ICMP next-hop report):", "%d bytes" % nh, col))
+    if reply_frag:
+        rows.append(("Reply path MTU (captured):", "%d bytes" % reply_mtu, C.YLW))
+        rows.append(("Effective PMTU (min of both):", "%d bytes" % eff_mtu, C.YLW))
+    rows.append(("PMTUD status:", pmtud_txt, None))
+    rows.append(("Path symmetry:", sym_txt, None))
+    rows.append(("Iterations:", "%d" % iterations, ""))
+
+    width = max(len(label) for label, _, _ in rows) + 1
+    for label, val, color in rows:
+        if color is None:
+            print("  %-*s %s" % (width, label, val))
+        else:
+            row(label, val, color, width)
+
+    if nh and nh != fwd_mtu:
+        info("Note: ICMP-reported next-hop MTU (%d) differs from the verified" % nh)
+        info("value (%d). The verified binary-search result is authoritative." % fwd_mtu)
+    if sym_extra_info:
         info("Forward path is limited to %d but the reply path carries >=%d." %
              (fwd_mtu, reply_probe_size))
-    row("Iterations:", "%d" % iterations)
     print("")
 
     # ── NAT / PMTUD black-hole detection ─────────────────────────
@@ -649,6 +701,7 @@ def main():
         info("exercised. If you expect a smaller path MTU, raise --max or test")
         info("toward a target across the narrower link.")
 
+    print("")
     # ── MSS suggestion ───────────────────────────────────────────
     print("  %sMSS suggestion%s" % (C.BLD, C.RST))
     print("  %s%s%s" % (C.GRY, "-" * 52, C.RST))
@@ -659,7 +712,6 @@ def main():
         warn("MSS below the TCP/IPv4 minimum (536B) — check path/measurement")
     else:
         row(label, "%d bytes" % mss, C.GRN)
-    print("")
     info("Cisco IOS:   %sip tcp adjust-mss %d%s   (on the interface)" % (C.BLD, mss, C.RST))
     if reply_frag:
         info("MSS is taken from the smaller (reply) direction. The forward path alone")
