@@ -14,10 +14,17 @@ for embedding behind a web frontend (`--quiet-header`) — see below.
 ---
 
 
-## Install/Update  muxpi.sh  
-```
+## Install/Update
+
+```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ewaldj/pmtu-diag/main/e-install.sh)"
 ```
+
+`e-install.sh` downloads `pmtu-diag.py` from this repository, installs it into
+a target directory (default `/usr/local/bin`, prompted interactively), and
+creates an extensionless symlink `pmtu-diag` alongside it. It uses `sudo`
+automatically if the target directory isn't writable by the current user.
+Re-running the command updates an existing install in place.
 
 
 ## What it measures
