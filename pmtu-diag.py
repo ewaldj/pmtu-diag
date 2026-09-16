@@ -31,7 +31,7 @@
 #   (auto-elevates via sudo if not already root)
 # ================================================================
 
-VERSION = "1.00"
+VERSION = "1.02"
 
 import argparse
 import os
@@ -84,16 +84,23 @@ def have_cap_net_raw():
     return False
 
 
-needs_sudo = os.geteuid() != 0
-if sys.platform.startswith("linux"):
-    has_capability = have_cap_net_raw()
-    if os.geteuid() == 0 and not has_capability:
-        die("ERROR: CAP_NET_RAW is not effective, even though this process is root.\n"
-            "  Container runtimes can remove it from root. Ensure NET_RAW is in the\n"
-            "  effective and bounding capability sets; check seccomp, AppArmor or SELinux.")
-    needs_sudo = not has_capability
+def ensure_raw_socket_access():
+    """Verify raw-socket access (root or CAP_NET_RAW), re-exec via sudo if
+    neither is present. Called from main() rather than at module import time,
+    so importing this module (e.g. as an installed package, or by --help)
+    never triggers a sudo prompt on its own."""
+    needs_sudo = os.geteuid() != 0
+    if sys.platform.startswith("linux"):
+        has_capability = have_cap_net_raw()
+        if os.geteuid() == 0 and not has_capability:
+            die("ERROR: CAP_NET_RAW is not effective, even though this process is root.\n"
+                "  Container runtimes can remove it from root. Ensure NET_RAW is in the\n"
+                "  effective and bounding capability sets; check seccomp, AppArmor or SELinux.")
+        needs_sudo = not has_capability
 
-if needs_sudo:
+    if not needs_sudo:
+        return
+
     # Without root or CAP_NET_RAW, re-exec through sudo so the user is
     # prompted for their password, then continues as root. We guard against
     # an infinite loop with an env marker in case sudo itself fails to
@@ -121,7 +128,6 @@ if needs_sudo:
         die("ERROR: failed to re-exec via sudo: %s" % e)
     # execvpe replaces this process; reaching here means it failed.
     die("ERROR: sudo elevation did not take effect.")
-
 
 
 # ── Colors (only when stdout is a TTY) ───────────────────────────
@@ -157,11 +163,11 @@ def row(label, val, color="", width=26):
 # A "probe" is a single ICMP echo request of a chosen total IP size.
 # total_size = payload + 28; payload is what scapy puts in Raw().
 
-def make_request(target, total_size, df, ident, seq):
+def make_request(target, total_size, df, ident, seq, src_ip):
     """Build an ICMP echo probe of a given total IP size."""
     flags = "DF" if df else 0
     payload_len = max(0, total_size - PROBE_OVERHEAD)
-    pkt = IP(dst=target, flags=flags) / \
+    pkt = IP(src=src_ip, dst=target, flags=flags) / \
         ICMP(type=8, id=ident, seq=seq) / (b"\xa5" * payload_len)
     return pkt
 
@@ -184,13 +190,13 @@ def classify_reply(reply):
     return ("other", 0)
 
 
-def probe_df(target, total_size, iface, timeout, ident):
+def probe_df(target, total_size, iface, timeout, ident, src_ip):
     """Send a single DF echo of total_size. Returns (status, nexthop_mtu).
     status: 'pass' | 'frag-needed' | 'timeout' | 'other' | 'local-reject'.
     'pass' = echo reply. 'local-reject' = the OS refused to send locally
     (packet > egress NIC MTU; common on macOS/BPF — never left the host)."""
     pkt = make_request(target, total_size, df=True, ident=ident,
-                       seq=total_size & 0xffff)
+                       seq=total_size & 0xffff, src_ip=src_ip)
     try:
         reply = sr1(pkt, timeout=timeout, verbose=0)
     except OSError:
@@ -207,7 +213,7 @@ def probe_df(target, total_size, iface, timeout, ident):
     return ("other", 0)
 
 
-def probe_df_repeat(target, total_size, iface, timeout, ident, count, need):
+def probe_df_repeat(target, total_size, iface, timeout, ident, count, need, src_ip):
     """Repeat a DF probe up to `count` times; 'pass' if >= need confirmations.
     Returns ('pass'|'fail'|'frag-needed'|'local-reject', nexthop_mtu_seen)."""
     confirms = 0
@@ -215,7 +221,7 @@ def probe_df_repeat(target, total_size, iface, timeout, ident, count, need):
     saw_frag = False
     saw_reject = False
     for i in range(count):
-        status, nh = probe_df(target, total_size, iface, timeout, ident + i)
+        status, nh = probe_df(target, total_size, iface, timeout, ident + i, src_ip)
         if status == "pass":
             confirms += 1
         elif status == "frag-needed":
@@ -244,7 +250,7 @@ def probe_df_repeat(target, total_size, iface, timeout, ident, count, need):
 # total length of the first fragment (MF set, offset 0) is the return-path
 # MTU at the narrowest hop.
 
-def measure_reply_mtu(target, total_size, iface, timeout, ident, count):
+def measure_reply_mtu(target, total_size, iface, timeout, ident, count, src_ip):
     """Returns (frag_count, reply_mtu, sent_ok, sniffer_ok).
     reply_mtu = IP total length of the largest first/middle fragment seen
     (0 = no fragmentation observed). sent_ok=False means the probe could
@@ -273,7 +279,8 @@ def measure_reply_mtu(target, total_size, iface, timeout, ident, count):
 
     import time as _t
     for i in range(count):
-        pkt = make_request(target, total_size, df=False, ident=ident + i, seq=i + 1)
+        pkt = make_request(target, total_size, df=False, ident=ident + i,
+                           seq=i + 1, src_ip=src_ip)
         try:
             send(pkt, verbose=0)
             sent_ok = True
@@ -334,7 +341,7 @@ def local_mtu_for(iface):
 
 # ── Forward binary search ────────────────────────────────────────
 def binary_search_mtu(target, iface, timeout, count, need, lo_start, hi_start,
-                      ident_base, verbose=True):
+                      ident_base, src_ip, verbose=True):
     """Run a DF binary search for the forward path MTU.
     Returns a dict with keys: mtu, iterations, saw_fragneeded, saw_silent,
     nexthop. Prints each probe when verbose."""
@@ -348,7 +355,7 @@ def binary_search_mtu(target, iface, timeout, count, need, lo_start, hi_start,
         iterations += 1
         status, nh = probe_df_repeat(target, mid, iface, timeout,
                                      ident=ident_base + iterations * count,
-                                     count=count, need=need)
+                                     count=count, need=need, src_ip=src_ip)
         if nh:
             nexthop = nh
         if status == "pass":
@@ -402,6 +409,10 @@ def main():
                          "a visitor, and the target is already shown on the page)")
     args = ap.parse_args()
 
+    # Raw-socket access is required from here on; checked (and elevated via
+    # sudo if needed) only now so --help/-h never triggers a sudo prompt.
+    ensure_raw_socket_access()
+
     target = args.target
     target_host = None
     # Resolve a hostname to an IPv4 address. scapy's routing and our BPF
@@ -423,6 +434,27 @@ def main():
         route_iface, src_ip, _gw = conf.route.route(target)
     except Exception:
         route_iface, src_ip = (None, None)
+
+    # Scapy may return 0.0.0.0 when a Linux route lacks RTA_PREFSRC (for example,
+    # inside Kubernetes pods), even though the kernel can select a valid source
+    # address. Ask the kernel to perform route/source-address selection using a
+    # connected UDP socket and use the resulting local address.
+    if src_ip == "0.0.0.0":
+        try:
+            import socket
+
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route_sock:
+                route_sock.connect((target, 9)) # some port, doesn't matter
+                src_ip = route_sock.getsockname()[0]
+        except Exception as e:
+            die("ERROR: unable to determine the source IP from the kernel: %s" % e)
+
+        if src_ip == "0.0.0.0":
+            die(
+                "ERROR: no usable IPv4 source address for %s; both Scapy and "
+                "the kernel returned 0.0.0.0." % target
+            )
+
     iface = args.iface or route_iface
     count = max(1, args.count)
     need = (count // 2) + 1     # majority of probes must succeed
@@ -470,7 +502,7 @@ def main():
 
     # ── 1: Reachability ──────────────────────────────────────────
     hdr("1/5  Reachability", blank_before=not args.quiet_header)
-    r = sr1(IP(dst=target) / ICMP() / (b"\xa5" * 56),
+    r = sr1(IP(src=src_ip, dst=target) / ICMP() / (b"\xa5" * 56),
             timeout=timeout, verbose=0)
     if classify_reply(r)[0] != "echo":
         fail("Target %s did not answer a basic ICMP echo — aborting." % target)
@@ -494,7 +526,8 @@ def main():
     nexthop_reported = 0
 
     # Small DF packet must pass.
-    st, _ = probe_df(target, IPV4_MIN_MTU, iface, timeout, ident=0x1000)
+    st, _ = probe_df(target, IPV4_MIN_MTU, iface, timeout, ident=0x1000,
+                     src_ip=src_ip)
     if st == "pass":
         ok("DF small (%dB): %spassed%s" % (IPV4_MIN_MTU, C.GRN, C.RST))
     else:
@@ -509,7 +542,8 @@ def main():
         over = min(local_mtu, max_mtu + 200)
     else:
         over = local_mtu     # cannot exceed the NIC; search will reveal PMTUD
-    st, nh = probe_df(target, over, iface, timeout, ident=0x2000)
+    st, nh = probe_df(target, over, iface, timeout, ident=0x2000,
+                      src_ip=src_ip)
     if st == "frag-needed":
         nexthop_reported = nh
         if nh:
@@ -539,7 +573,8 @@ def main():
          (IPV4_MIN_MTU, max_mtu, need, count))
 
     res = binary_search_mtu(target, iface, timeout, count, need,
-                            IPV4_MIN_MTU, max_mtu, ident_base=0x3000)
+                            IPV4_MIN_MTU, max_mtu, ident_base=0x3000,
+                            src_ip=src_ip)
     fwd_mtu = res["mtu"]
     iterations = res["iterations"]
     nexthop_during_search = res["nexthop"]
@@ -557,7 +592,8 @@ def main():
     # host), so cap the probe at local_mtu regardless of --max.
     reply_probe_size = min(max_mtu, local_mtu)
     frag_count, reply_mtu, reply_sent_ok, reply_sniffer_ok = measure_reply_mtu(
-        target, reply_probe_size, iface, timeout, ident=0x4000, count=count)
+        target, reply_probe_size, iface, timeout, ident=0x4000, count=count,
+        src_ip=src_ip)
 
     reply_frag = False
     if not reply_sniffer_ok:

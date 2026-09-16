@@ -20,11 +20,16 @@ for embedding behind a web frontend (`--quiet-header`) — see below.
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ewaldj/pmtu-diag/main/e-install.sh)"
 ```
 
-`e-install.sh` downloads `pmtu-diag.py` from this repository, installs it into
-a target directory (default `/usr/local/bin`, prompted interactively), and
-creates an extensionless symlink `pmtu-diag` alongside it. It uses `sudo`
-automatically if the target directory isn't writable by the current user.
-Re-running the command updates an existing install in place.
+`e-install.sh` installs the [`pmtu-diag` PyPI package](https://pypi.org/project/pmtu-diag/)
+via `pipx install --global`, so the `pmtu-diag` command lands in a shared
+location (typically `/usr/local/bin`) usable by every user on the machine,
+while scapy stays isolated in pipx's own venv rather than the system Python.
+It installs `pipx` itself first if missing (via `apt` or `brew`), uses `sudo`
+automatically if the global location isn't writable, and re-running it
+updates an existing install in place. No prompts, no options.
+
+Equivalent manual command: `pipx install pmtu-diag --global` (add `sudo` if
+the global pipx location isn't writable by your user).
 
 
 ## What it measures
@@ -85,6 +90,13 @@ and skips the sudo re-exec.
 
 Capabilities only work on filesystems supporting the `security.capability`
 xattr (ext4/xfs/btrfs — not tmpfs/overlayfs/NFS/9p).
+
+> **Installed via `e-install.sh`/pipx?** The steps below target the system
+> `python3`. With a pipx install, the interpreter that actually runs
+> `pmtu-diag` lives inside pipx's own venv instead — find it with
+> `pipx list --global` (or `pipx list` for a per-user install) and use
+> that path (e.g. `/opt/pipx/venvs/pmtu-diag/bin/python3`) in step 2 below
+> instead of the system interpreter.
 
 ```bash
 # 1. Locate the real interpreter binary (not a venv shim/symlink)
