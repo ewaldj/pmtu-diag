@@ -164,6 +164,9 @@ The script auto-elevates with `sudo` when neither root nor `CAP_NET_RAW` is
 available, so a leading `sudo` is optional interactively. Ping sweep mode
 (`-p`) never elevates.
 
+Output is colored only on a terminal; set `PMTU_FORCE_COLOR=1` to force colors
+when stdout is not a TTY (e.g. when piping).
+
 ### Examples
 
 ```bash
