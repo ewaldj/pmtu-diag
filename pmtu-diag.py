@@ -29,12 +29,22 @@
 #
 # Usage: ./pmtu-diag.py <target-IP> [-i IFACE] [-c COUNT] [--max MTU]
 #   (auto-elevates via sudo if not already root)
+#
+# Ping sweep mode (-p): plain echo requests over an unprivileged ICMP
+# datagram socket, one per MTU in -r LO-HI (default 1200-1500), DF set
+# unless -ndf. Needs neither root nor scapy; no other checks are done.
+# (Linux: ICMP datagram socket; macOS: system ping.)
+#   ./pmtu-diag.py <target> -p [-r LO-HI] [-ndf]
 # ================================================================
 
-VERSION = "1.02"
+VERSION = "1.05"
 
 import argparse
+import errno
 import os
+import socket
+import struct
+import subprocess
 import sys
 import time
 
@@ -52,6 +62,7 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+SCAPY_ERR = None
 try:
     # Silence scapy's own logging. It otherwise prints IPv6/route warnings
     # on import AND dumps a full traceback to stderr on send errors like
@@ -61,7 +72,8 @@ try:
         logging.getLogger(_ln).setLevel(logging.CRITICAL)
     from scapy.all import IP, ICMP, Raw, sr1, sr, send, AsyncSniffer, conf
 except ImportError:
-    die(
+    # Deferred: the ping sweep mode (-p) does not need scapy.
+    SCAPY_ERR = (
         "ERROR: scapy is not installed.\n"
         "  Debian/Ubuntu : sudo apt install python3-scapy\n"
         "  macOS (brew)  : pip3 install scapy\n"
@@ -390,6 +402,140 @@ def pmtud_verdict(saw_frag, saw_silent, pending):
 
 
 # ── Main ─────────────────────────────────────────────────────────
+# ── Ping sweep mode (-p): unprivileged, no scapy ─────────────────
+SWEEP_DEFAULT_RANGE = "1200-1500"
+
+
+def parse_range(txt):
+    try:
+        lo, hi = [int(x) for x in txt.split("-", 1)]
+    except ValueError:
+        die("ERROR: invalid range '%s' (expected LO-HI, e.g. 1200-1500)." % txt)
+    if lo < PROBE_OVERHEAD or hi > 65535 or lo > hi:
+        die("ERROR: range must satisfy %d <= LO <= HI <= 65535." % PROBE_OVERHEAD)
+    return lo, hi
+
+
+def icmp_checksum(data):
+    if len(data) % 2:
+        data += b"\0"
+    tot = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    tot = (tot >> 16) + (tot & 0xFFFF)
+    tot += tot >> 16
+    return ~tot & 0xFFFF
+
+
+def sweep_probe_ping(target, mtu, df, timeout):
+    """macOS: an ICMP datagram socket never reports received ICMP errors, so
+    use the system ping (/sbin/ping runs unprivileged and prints
+    "frag needed and DF set"). Same return values as sweep_probe()."""
+    cmd = ["ping", "-c", "1", "-s", str(mtu - PROBE_OVERHEAD),
+           "-W", str(max(1, int(timeout * 1000)))]
+    if df:
+        cmd.append("-D")
+    cmd.append(target)
+    env = dict(os.environ, LC_ALL="C")
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=timeout + 3, env=env)
+    except subprocess.TimeoutExpired:
+        return "SILENT"
+    except OSError as e:
+        die("ERROR: cannot run ping: %s" % e)
+    out = r.stdout.lower()
+    if r.returncode == 0:
+        return "OK"
+    if "frag needed" in out or "message too long" in out:
+        return "FRAG"
+    return "SILENT"
+
+
+def sweep_probe(target, mtu, df, timeout, seq):
+    """One echo of total IP size 'mtu' via an ICMP datagram socket.
+    Returns "OK", "FRAG" (EMSGSIZE: local MTU/cached PMTU or ICMP
+    frag-needed received) or "SILENT" (no reply)."""
+    if sys.platform == "darwin":
+        return sweep_probe_ping(target, mtu, df, timeout)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
+    except PermissionError:
+        die("ERROR: unprivileged ICMP sockets are not permitted for this user.\n"
+            "  Linux: sudo sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"")
+    except OSError as e:
+        die("ERROR: cannot open ICMP datagram socket: %s" % e)
+    try:
+        try:
+            if sys.platform.startswith("linux"):
+                # IP_PMTUDISC_DO = 2 (DF set), IP_PMTUDISC_DONT = 0
+                sock.setsockopt(socket.IPPROTO_IP,
+                                getattr(socket, "IP_MTU_DISCOVER", 10), 2 if df else 0)
+            else:
+                # BSD/macOS: IP_DONTFRAG = 28
+                sock.setsockopt(socket.IPPROTO_IP,
+                                getattr(socket, "IP_DONTFRAG", 28), 1 if df else 0)
+        except OSError as e:
+            die("ERROR: cannot set the DF option on this system: %s" % e)
+        payload = b"\xa5" * (mtu - PROBE_OVERHEAD)
+        hdr0 = struct.pack("!BBHHH", 8, 0, 0, os.getpid() & 0xFFFF, seq)
+        pkt = struct.pack("!BBHHH", 8, 0, icmp_checksum(hdr0 + payload),
+                          os.getpid() & 0xFFFF, seq) + payload
+        try:
+            # connect() so the OS reports received ICMP errors (frag-needed)
+            # on this socket; an unconnected datagram ICMP socket drops them.
+            sock.connect((target, 0))
+            sock.send(pkt)
+        except OSError as e:
+            if e.errno == errno.EMSGSIZE:
+                return "FRAG"
+            die("ERROR: send failed: %s" % e)
+        deadline = time.time() + timeout
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                return "SILENT"
+            sock.settimeout(left)
+            try:
+                data, _ = sock.recvfrom(65535)
+            except socket.timeout:
+                return "SILENT"
+            except OSError as e:
+                if e.errno == errno.EMSGSIZE:
+                    return "FRAG"
+                return "SILENT"
+            if data and (data[0] >> 4) == 4:          # macOS includes the IP header
+                data = data[(data[0] & 0x0F) * 4:]
+            if len(data) >= 8 and data[0] == 0 and struct.unpack("!H", data[6:8])[0] == seq:
+                return "OK"
+    finally:
+        sock.close()
+
+
+def run_sweep(args):
+    lo, hi = parse_range(args.range or SWEEP_DEFAULT_RANGE)
+    df = not args.no_df
+    target = args.target
+    try:
+        target = socket.getaddrinfo(target, None, socket.AF_INET)[0][4][0]
+    except Exception:
+        die("ERROR: could not resolve hostname '%s' to an IPv4 address." % args.target)
+    if not args.quiet_header:
+        print("  %spmtu-diag v%s  ping sweep  %s  MTU %d-%d  DF %s%s" %
+              (C.BLD, VERSION, args.target, lo, hi, "set" if df else "not set", C.RST))
+    best = None
+    for seq, mtu in enumerate(range(lo, hi + 1), 1):
+        res = sweep_probe(target, mtu, df, args.timeout, seq & 0xFFFF)
+        if res == "OK":
+            best = mtu
+            st = "%sOK%s" % (C.GRN, C.RST)
+        elif res == "FRAG":
+            st = "%sDROP (frag-needed)%s" % (C.RED, C.RST)
+        else:
+            st = "%sDROP (silent)%s" % (C.RED, C.RST)
+        print("  MTU %5d B  (payload %5d B)  -  %s" % (mtu, mtu - PROBE_OVERHEAD, st))
+        sys.stdout.flush()
+    print("  Largest OK: %s" % ("%d B" % best if best else "none"))
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Bidirectional Path MTU diagnostics via raw ICMP (scapy).")
@@ -407,7 +553,22 @@ def main():
                          "(used for the web version — server-internal details "
                          "like the local interface name aren't meaningful to "
                          "a visitor, and the target is already shown on the page)")
+    ap.add_argument("-p", "--ping-sweep", action="store_true",
+                    help="ping sweep mode: only echo requests for every MTU in -r, "
+                         "no other checks; needs no root and no scapy")
+    ap.add_argument("-r", "--range", default=None, metavar="LO-HI",
+                    help="MTU range for -p (default: %s)" % SWEEP_DEFAULT_RANGE)
+    ap.add_argument("-ndf", "--no-df", action="store_true",
+                    help="-p only: do not set the DF bit (default: DF set)")
     args = ap.parse_args()
+
+    if (args.range or args.no_df) and not args.ping_sweep:
+        ap.error("-r and -ndf require -p")
+    if args.ping_sweep:
+        run_sweep(args)
+        return
+    if SCAPY_ERR:
+        die(SCAPY_ERR)
 
     # Raw-socket access is required from here on; checked (and elevated via
     # sudo if needed) only now so --help/-h never triggers a sudo prompt.

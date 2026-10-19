@@ -8,8 +8,9 @@ tells you whether PMTU Discovery actually works on the path — something a plai
 (`pkt[IP].flags.MF`, `pkt[ICMP].type`, `pkt[IP].len`) rather than scraping
 `ping`/`tcpdump` text, so behaviour is deterministic and identical on Linux and macOS.
 
-Two run modes: interactive CLI use (colored, full header) and a quiet mode
-for embedding behind a web frontend (`--quiet-header`) — see below.
+Run modes: interactive CLI use (colored, full header), a quiet mode for embedding
+behind a web frontend (`--quiet-header`), and an unprivileged **ping sweep** mode
+(`-p`) — see below.
 
 ---
 
@@ -144,6 +145,7 @@ Troubleshooting:
 
 ```bash
 ./pmtu-diag.py <target-IP> [-i IFACE] [-c COUNT] [--max MTU] [--timeout SEC] [--quiet-header]
+./pmtu-diag.py <target> -p [-r LO-HI] [-ndf] [--timeout SEC] [--quiet-header]
 ```
 
 | Option | Default | Description |
@@ -153,10 +155,14 @@ Troubleshooting:
 | `-c`, `--count` | `3` | Probes per test; a majority (`count//2 + 1`) must succeed to confirm a size. |
 | `--max` | local MTU | Upper MTU bound for the forward binary search. |
 | `--timeout` | `2.0` | Per-probe reply timeout in seconds. |
+| `-p`, `--ping-sweep` | off | Ping sweep mode (see below). |
+| `-r` | `1200-1500` | `-p` only: MTU range `LO-HI` (total IP size, payload = MTU − 28). |
+| `-ndf`, `--no-df` | off (DF set) | `-p` only: do not set the DF bit. |
 | `--quiet-header` | off | Suppress the banner/timestamp/interface/local-MTU/source-IP header lines. For embedding behind a web frontend (e.g. `pmtu.php`): those server-internal details aren't meaningful to a visitor, and the target is already shown on the page. The `1/5` … `5/5` section headers still print. |
 
 The script auto-elevates with `sudo` when neither root nor `CAP_NET_RAW` is
-available, so a leading `sudo` is optional interactively.
+available, so a leading `sudo` is optional interactively. Ping sweep mode
+(`-p`) never elevates.
 
 ### Examples
 
@@ -172,6 +178,27 @@ available, so a leading `sudo` is optional interactively.
 
 # Web-embedded call (no banner/interface/local-IP details)
 ./pmtu-diag.py 192.0.2.1 --quiet-header
+```
+
+### Ping sweep mode (`-p`)
+
+Sends one plain ICMP echo request per MTU in the range (default `1200-1500`,
+DF bit set unless `-ndf`) and prints `OK` / `DROP` per size plus the largest
+size that was answered. No other checks, no sniffing.
+
+- Runs **without root and without scapy**: Linux uses an unprivileged ICMP
+  datagram socket (stdlib only), macOS uses the system `ping` (`-D` for DF).
+- `DROP (frag-needed)`: the OS refused the size (local MTU / cached path MTU)
+  or an ICMP *Fragmentation Needed* came back. `DROP (silent)`: no reply.
+- Linux requires the user's group to be inside `net.ipv4.ping_group_range`
+  (check: `sysctl net.ipv4.ping_group_range`; allow all:
+  `sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"`).
+- With a silent-drop path, each dropped size waits `--timeout` seconds.
+
+```bash
+./pmtu-diag.py 192.0.2.1 -p                   # 1200-1500, DF set
+./pmtu-diag.py 192.0.2.1 -p -r 1000-1500      # custom range
+./pmtu-diag.py 192.0.2.1 -p -ndf              # DF not set
 ```
 
 ---
