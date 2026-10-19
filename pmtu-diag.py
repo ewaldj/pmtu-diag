@@ -37,7 +37,7 @@
 #   ./pmtu-diag.py <target> -p [-r LO-HI] [-ndf]
 # ================================================================
 
-VERSION = "1.05"
+VERSION = "1.06"
 
 import argparse
 import errno
@@ -144,7 +144,7 @@ def ensure_raw_socket_access():
 
 # ── Colors (only when stdout is a TTY) ───────────────────────────
 class C:
-    if sys.stdout.isatty():
+    if sys.stdout.isatty() or os.environ.get("PMTU_FORCE_COLOR") == "1":
         RED = "\033[0;31m"; GRN = "\033[0;32m"; YLW = "\033[1;33m"
         CYN = "\033[0;36m"; BLD = "\033[1m";    RST = "\033[0m"
         GRY = "\033[2;37m"; MGN = "\033[0;35m"
